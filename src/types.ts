@@ -131,8 +131,15 @@ export interface CompactOptions {
   rules?: boolean;
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
-  /** Minimum keep probability for a call or result to stay. Default 0.5. */
+  /** Items scoring below this are always removed. Default 0.5. */
   keepThreshold?: number;
+  /**
+   * Character reduction to aim for: the cut rises above `keepThreshold`,
+   * lowest-scored items first, until this much is saved or only the top score
+   * is left. Laya's absolute probabilities cluster in 0.5-0.9, so only its
+   * ranking is informative. 0 keeps the fixed threshold. Default 0.6.
+   */
+  targetReduction?: number;
   /** Newest messages never touched (the first message is always kept). Default 6. */
   preserveRecentMessages?: number;
   /** Estimated token ceiling for the state. Default 25000. */
@@ -149,6 +156,7 @@ export interface ResolvedCompactOptions {
   rules: boolean;
   goal: string;
   keepThreshold: number;
+  targetReduction: number;
   preserveRecentMessages: number;
   maxStateTokens: number;
   maxRequestTokens: number;
@@ -170,7 +178,11 @@ export interface CompactResult {
     callsDropped: number;
     /** Results truncated by the rules, without a judge request. */
     superseded: number;
+    /** Requests Laya truncated at its input cap and that were re-asked with a smaller state. */
+    truncatedRetries: number;
     pinned: number;
+    /** The keep cut actually applied (`keepThreshold`, raised toward `targetReduction`). */
+    threshold: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */
     stateStage: string;

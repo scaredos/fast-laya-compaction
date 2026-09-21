@@ -56,11 +56,19 @@ built-in compaction summary with the original messages.
    stays under `maxRequestTokens` (30k by default, under Jev's 32k request
    limit). The same full state is resent with every request; requests run
    concurrently and their answers are merged.
-6. Decisions per call, against `keepThreshold`:
-   - `keepResult ≥ threshold` → keep call and result;
-   - else `keepCall ≥ threshold` → keep the call, truncate the result to its
+6. Decisions per call, against a cut that starts at `keepThreshold`:
+   - `keepResult ≥ cut` → keep call and result;
+   - else `keepCall ≥ cut` → keep the call, truncate the result to its
      first `truncateHeadChars` characters plus a one-line note;
    - else → remove the call together with its result.
+
+   Laya's absolute probabilities bunch up (on a real 650k-token session, 268
+   of 278 results scored between 0.5 and 0.9, so a fixed 0.5 cut removed 6%),
+   but its ranking is informative. The cut therefore rises through the
+   scores, lowest first, until `targetReduction` of the characters is gone
+   (60% on that session) or only the top score is left. `npm run replay --
+   <session.jsonl>` prints the score histogram and the reduction per cut for
+   any Claude Code transcript.
 7. The message list is rebuilt: a message that loses all its content is
    removed, untouched messages are returned as the same objects, and no result
    is ever left without its call.
@@ -129,7 +137,8 @@ response validation. The building blocks (`collectToolCalls`, `fitState`,
 | `apiKey` | none | Unused for local Laya; sent as a Bearer header only if set |
 | `fetch` | native `fetch` | Injectable fetch implementation for tests |
 | `goal` | last 3 user prompts | Ongoing task description included in the state |
-| `keepThreshold` | `0.5` | Minimum keep probability for a call or result to stay |
+| `keepThreshold` | `0.5` | Items scoring below this are always removed |
+| `targetReduction` | `0.6` | Raise the cut, lowest scores first, until this share of characters is removed; `0` keeps the fixed cut |
 | `preserveRecentMessages` | `6` | Newest messages never touched (the first is always kept) |
 | `maxStateTokens` | `500` | Estimated-token ceiling for one state (per call in `local` mode) |
 | `maxRequestTokens` | `620` | Estimated-token ceiling for one state plus its questions (~1000 real at Laya) |
@@ -172,7 +181,12 @@ questions under the `maxRequestTokens` 620 request ceiling). The budgets are in
 this library's tokenizer-free *estimate*, and Laya's tokenizer counts 1.5–1.75×
 more than the estimate on code-heavy content (`npm run calibrate` measured
 est 610 → 948 real, est 828 → truncated), which is why 620 estimated is the
-ceiling for a ~1000-real-token request. Each state holds:
+ceiling for a ~1000-real-token request. The ratio is content-dependent (a
+data-heavy transcript measured 104 of 123 requests hitting the cap at these
+defaults), so the estimate is only a starting point: when Laya reports
+`usage.input_tokens` at the cap the call is re-asked with a 40% smaller state,
+and that shrink is shared with the rest of the run. The toast shows it as
+`N re-asked after truncation`. Each state holds:
 
 - `goal` — the last user prompts;
 - `call` — the call's input and the head of its output, shrunk in steps
@@ -235,8 +249,18 @@ server. Set `LAYA_URL` in your settings `env` to point at a different host/port.
 Restart Claude Code or run `/reload-plugins`. From then on `/compact` (and
 auto-compaction) goes through Laya: the toast reads
 `fast-laya-compaction: kept N/M messages, no summary (…)` when the pruned history
-replaced the built-in summary, or `fallback to built-in summary (…)` when Laya
-could not remove enough (short sessions, or when it fails or is unreachable).
+replaced the built-in summary; `pruned N/M messages for the built-in summary (…)`
+when Laya removed less than `minReductionRatio` (the summarizer then reads the
+pruned transcript instead of the whole one); or `fallback to built-in summary (…)`
+when the server failed or was unreachable. The last 20 outcomes are kept in the
+plugin store, and the server logs one line per request to
+`server/laya_server.log` when started with `server/start.ps1`.
+
+An installed plugin runs from a cached copy, not the checkout. After editing
+the checkout, bump `version` in `.claude-plugin/plugin.json` and
+`.claude-plugin/marketplace.json`, then run
+`claude plugin update fast-laya-compaction@fast-laya-compaction` and
+`/reload-plugins`.
 
 To run from a checkout without installing: `CLAUDE_CODE_ENABLE_FUNCTION_HOOKS=1 claude --plugin-dir .`
 from the repository root. No publishing step is required; the marketplace is

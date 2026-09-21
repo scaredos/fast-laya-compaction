@@ -3,3 +3,4 @@ dist
 .env
 demo/JevDemo/build
 /server/__pycache__
+server/*.log

@@ -63,6 +63,7 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   const numbers: Partial<Omit<CompactOptions, 'goal'>> = {};
   for (const key of [
     'keepThreshold',
+    'targetReduction',
     'preserveRecentMessages',
     'maxStateTokens',
     'maxRequestTokens',
@@ -199,7 +200,9 @@ export function summarize(result: CompactResult): string {
   ].filter(Boolean);
   return `${percent(reductionRatio(result))} reduction; ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; cut ${stats.threshold.toFixed(2)}; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)${
+    stats.truncatedRetries > 0 ? `, ${stats.truncatedRetries} re-asked after truncation` : ''
+  }`;
 }
 
 const UI_LOG_MAX_CHARS = 4096;
@@ -256,17 +259,29 @@ async function getApiKey(
   return undefined;
 }
 
-function notify(
-  $: {
-    ui: {
-      log: (text: string) => void;
-      toast: (text: string, options?: { timeoutMs?: number }) => void;
-    };
-  },
-  text: string,
-): void {
+type Notifier = {
+  ui: {
+    log: (text: string) => void;
+    toast: (text: string, options?: { timeoutMs?: number }) => void;
+  };
+  store: { get: (key: string) => Promise<unknown>; set: (key: string, value: unknown) => Promise<void> };
+};
+
+const OUTCOME_LOG_KEY = 'outcomes';
+const OUTCOME_LOG_MAX = 20;
+
+/** Toast + UI log now, and the last few outcomes in the plugin store so they can be checked after the fact. */
+async function notify($: Notifier, trigger: string, text: string): Promise<void> {
   $.ui.log(text);
   $.ui.toast(text, { timeoutMs: 15_000 });
+  try {
+    const previous = (await $.store.get(OUTCOME_LOG_KEY)) as unknown[] | undefined;
+    const entries = Array.isArray(previous) ? previous : [];
+    entries.push({ at: new Date().toISOString(), trigger, text });
+    await $.store.set(OUTCOME_LOG_KEY, entries.slice(-OUTCOME_LOG_MAX));
+  } catch {
+    // the store is a convenience; never let it fail the compaction
+  }
 }
 
 export const register: Register = (on: On, options: PluginOptions) => {
@@ -287,20 +302,25 @@ export const register: Register = (on: On, options: PluginOptions) => {
       });
       for (const line of decisionLogLines(result)) $.ui.log(line);
       if (reductionRatio(result) < config.minReductionRatio) {
-        notify(
+        // Not enough saved to stand on its own: hand the pruned transcript to
+        // the built-in summarizer, so it reads less and Laya's work still counts.
+        await notify(
           $,
-          `fallback to built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
+          event.trigger,
+          `pruned ${messages.length}/${event.messages.length} messages for the built-in summary (below ${percent(config.minReductionRatio)} minimum: ${summarize(result)})`,
         );
-        return next(event);
+        return next({ ...event, messages });
       }
-      notify(
+      await notify(
         $,
+        event.trigger,
         `kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
     } catch (error) {
-      notify(
+      await notify(
         $,
+        event.trigger,
         `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`,
       );
       return next(event);

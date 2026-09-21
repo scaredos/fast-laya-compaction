@@ -9,7 +9,8 @@ repository root, so the hook imports it directly) and maps the result back
 onto session messages. User and assistant text is never touched. For every
 tool call outside the pinned first and newest messages, Laya gets two
 questions: whether the call should stay and whether its full output should
-stay. An item is kept when Laya's probability reaches `keepThreshold`; a
+stay. An item scoring below `keepThreshold` is dropped; above it the cut rises,
+lowest scores first, until `targetReduction` of the characters is removed. A
 dropped result is truncated to its first `truncateHeadChars` characters plus a
 one-line note, and a dropped call disappears with its result.
 
@@ -53,6 +54,7 @@ The plugin declares these `userConfig` values in
 | `concurrency` | `8` |
 | `rules` | `true` |
 | `keepThreshold` | `0.5` |
+| `targetReduction` | `0.6` |
 | `preserveRecentMessages` | `6` |
 | `compactAtPercent` | `60` |
 | `minReductionRatio` | `0.25` |
@@ -69,10 +71,12 @@ Laya checkpoint (`router` auto-selects by language, or `english`,
 Every option except `baseUrl`, `compactAtPercent`, `minReductionRatio` and
 `model` is passed straight to the library; see the root README for what they
 do. If the Laya server is unreachable or fails, the response is malformed, the
-history cannot be fitted into the state budget (`whole` mode), or the estimated
-reduction is below `minReductionRatio`, the hook logs a fallback and delegates
-to Claude Code's built-in compaction. The outcome is shown as a toast and
-logged with the reduction, per-reason counts, state size and request count; a
+history cannot be fitted into the state budget (`whole` mode), the hook logs a
+fallback and delegates to Claude Code's built-in compaction. When the estimated
+reduction is below `minReductionRatio`, it instead passes the pruned transcript
+on with `next({ ...e, messages })`, so the built-in summary is written over
+less. The outcome is shown as a toast, logged with the reduction, per-reason
+counts, state size and request count, and kept (last 20) in `$.store`; a
 per-call `decisions:` line with both probabilities is logged for diagnosis.
 The `turn.complete` hook requests compaction when `context.percent` reaches
 `compactAtPercent`, with an in-flight guard.

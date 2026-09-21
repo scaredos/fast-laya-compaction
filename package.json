@@ -25,6 +25,7 @@
     "demo": "tsx examples/demo.ts",
     "demo:oversized": "tsx examples/oversized.ts",
     "calibrate": "tsx examples/calibrate.ts",
+    "replay": "tsx examples/replay.ts",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
     "validate:plugin": "claude plugin validate .claude-plugin/plugin.json"
   },

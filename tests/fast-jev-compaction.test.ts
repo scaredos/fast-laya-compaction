@@ -19,6 +19,7 @@ import {
   type JevQuestions,
   type Message,
   type ToolCall,
+  LAYA_MAX_INPUT_TOKENS,
 } from '../src/index.js';
 
 function message(role: Message['role'], text: string, extra: Partial<Message> = {}): Message {
@@ -76,6 +77,7 @@ describe('options', () => {
   it('fills in defaults and ignores non-finite values', () => {
     expect(resolveOptions()).toMatchObject({
       keepThreshold: 0.5,
+      targetReduction: 0.6,
       preserveRecentMessages: 6,
       maxStateTokens: 500,
       maxRequestTokens: 620,
@@ -429,6 +431,51 @@ describe('rules', () => {
     const pure = await compact(session, fakeJev(() => 0.9, all), { preserveRecentMessages: 1, rules: false });
     expect(all).toHaveLength(6);
     expect(pure.stats).toMatchObject({ superseded: 0, kept: 6, requests: 6 });
+  });
+
+  it('re-asks with a smaller state when Laya reports its input cap', async () => {
+    const sizes: number[] = [];
+    const asker: JevAsker = {
+      async ask(state, questions) {
+        const size = JSON.stringify(state).length;
+        sizes.push(size);
+        // Pretend Laya truncated everything above ~800 chars of state.
+        const inputTokens = size > 800 ? LAYA_MAX_INPUT_TOKENS : 200;
+        return {
+          answers: Object.fromEntries(
+            Object.keys(questions).map((key) => [key, { type: 'noul' as const, noul: 0.9 }]),
+          ),
+          usage: { input_tokens: inputTokens, output_tokens: 0 },
+        };
+      },
+    };
+    const output = await compact(session, asker, { preserveRecentMessages: 1, rules: false });
+    expect(output.stats.truncatedRetries).toBeGreaterThan(0);
+    expect(output.stats.requests).toBe(6 + output.stats.truncatedRetries);
+    // the shrink is shared: once found, later calls do not each pay for it again
+    expect(output.stats.truncatedRetries).toBeLessThan(6);
+    // every retry shrank the state it followed
+    for (let i = 1; i < sizes.length; i++) if (sizes[i - 1]! > 800) expect(sizes[i]!).toBeLessThan(sizes[i - 1]!);
+    expect(output.decisions.every((d) => d.action === 'keep')).toBe(true);
+  });
+});
+
+describe('target reduction', () => {
+  const score = (name: string) => ({ result_t1: 0.6, result_t2: 0.7, result_t3: 0.8 } as Record<string, number>)[name] ?? 0.9;
+
+  it('raises the cut up the ranking until the target reduction is met', async () => {
+    const fixed = await compact(transcript(), fakeJev(score), { preserveRecentMessages: 1, targetReduction: 0 });
+    expect(fixed.stats.threshold).toBe(0.5);
+    expect(fixed.decisions.every((d) => d.action === 'keep')).toBe(true);
+
+    const all = await compact(transcript(), fakeJev(score), { preserveRecentMessages: 1, targetReduction: 1 });
+    // unreachable target: the cut stops at the top score, which survives
+    expect(all.stats.threshold).toBe(0.9);
+    expect(all.decisions.map((d) => d.action)).toEqual(['drop_result', 'drop_result', 'drop_result']);
+
+    const some = await compact(transcript(), fakeJev(score), { preserveRecentMessages: 1, targetReduction: 0.6 });
+    expect(some.stats.threshold).toBeGreaterThan(0.5);
+    expect(reductionRatio(some) >= 0.6 || some.stats.threshold === 0.9).toBe(true);
   });
 });
 

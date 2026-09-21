@@ -14,6 +14,7 @@ Point the plugin at it with LAYA_URL (default http://127.0.0.1:8756/predict).
 """
 import json
 import os
+import time
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -89,16 +90,24 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self):
         length = int(self.headers.get("content-length", 0))
         raw = self.rfile.read(length) if length else b"{}"
+        started = time.time()
         try:
             body = json.loads(raw or b"{}")
             result = predict(body)
         except Exception as exc:  # plugin treats any error as "fall back to built-in summary"
             self._send(500, {"error": str(exc)})
+            self.log_message("predict FAILED after %d ms: %s", (time.time() - started) * 1000, exc)
             return
         self._send(200, result)
+        self.log_message(
+            "predict ok: %d question(s), %s input tokens, %d ms",
+            len(body.get("questions") or {}),
+            (result.get("usage") or {}).get("input_tokens", "?"),
+            (time.time() - started) * 1000,
+        )
 
-    def log_message(self, *args):  # quiet; the plugin logs its own decisions
-        pass
+    def log_message(self, fmt, *args):  # one line per request, for checking what the plugin sent
+        print("%s %s" % (time.strftime("%H:%M:%S"), fmt % args), flush=True)
 
 
 def main():

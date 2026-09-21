@@ -23,6 +23,7 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
   rules: true,
   goal: '',
   keepThreshold: 0.5,
+  targetReduction: 0.6,
   preserveRecentMessages: 6,
   // Ceiling is Laya's window, not Jev's 32k: laya 0.3.4 silently truncates
   // every request at 1024 tokens (it reports the count in usage.input_tokens).
@@ -38,6 +39,10 @@ export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
 
 /** Tokens the request envelope (`model`, key names) adds around state and questions. */
 const REQUEST_OVERHEAD_TOKENS = 20;
+/** Laya silently truncates its input here; `usage.input_tokens` lands exactly on it when it did. */
+export const LAYA_MAX_INPUT_TOKENS = 1024;
+const RETRY_SHRINK = 0.6;
+const MIN_BUDGET_TOKENS = 120;
 
 function finite(value: number | undefined, fallback: number): number {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
@@ -50,6 +55,7 @@ export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOpt
     rules: options.rules ?? DEFAULT_OPTIONS.rules,
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
     keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
+    targetReduction: Math.min(1, Math.max(0, finite(options.targetReduction, DEFAULT_OPTIONS.targetReduction))),
     preserveRecentMessages: Math.max(
       0,
       Math.floor(
@@ -206,21 +212,37 @@ async function askLocal(
   calls: readonly ToolCall[],
   call: ToolCall,
   options: ResolvedCompactOptions,
-): Promise<{ answer: CallAnswer; tokens: number }> {
+  calibration: { scale: number },
+): Promise<{ answer: CallAnswer; tokens: number; retries: number }> {
   const questions = questionsFor(call);
-  const budget = Math.min(
+  const base = Math.min(
     options.maxStateTokens,
     options.maxRequestTokens - estimateTokens(JSON.stringify(questions)) - REQUEST_OVERHEAD_TOKENS,
   );
-  const { state, tokens } = localState(messages, calls, call, options, budget);
-  const { answers } = await asker.ask(state, questions);
-  return {
-    answer: {
-      keepCall: noulAnswer(answers, `call_${call.id}`),
-      keepResult: noulAnswer(answers, `result_${call.id}`),
-    },
-    tokens,
-  };
+  let budget = Math.floor(base * calibration.scale);
+  // The estimator undercounts Laya's tokenizer by a content-dependent factor
+  // (1.5x on code, more on data-heavy transcripts). Laya reports the cap in
+  // `usage` when it truncated, so shrink and ask again rather than judge on a
+  // cut-off state; the shrink is shared so later calls in the run start there.
+  let retries = 0;
+  for (;;) {
+    const { state, tokens } = localState(messages, calls, call, options, budget);
+    const { answers, usage } = await asker.ask(state, questions);
+    const truncated = (usage?.input_tokens ?? 0) >= LAYA_MAX_INPUT_TOKENS;
+    if (!truncated || budget <= MIN_BUDGET_TOKENS) {
+      return {
+        answer: {
+          keepCall: noulAnswer(answers, `call_${call.id}`),
+          keepResult: noulAnswer(answers, `result_${call.id}`),
+        },
+        tokens,
+        retries,
+      };
+    }
+    budget = Math.max(MIN_BUDGET_TOKENS, Math.floor(budget * RETRY_SHRINK));
+    calibration.scale = Math.min(calibration.scale, budget / base);
+    retries += 1;
+  }
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -380,14 +402,17 @@ export async function compact(
 
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
   let requests = 0;
+  let truncatedRetries = 0;
   const answers = new Map<string, CallAnswer>();
   if (candidates.length > 0 && resolved.stateMode === 'local') {
+    const calibration = { scale: 1 };
     const asked = await mapLimit(candidates, resolved.concurrency, (call) =>
-      askLocal(asker, messages, calls, call, resolved),
+      askLocal(asker, messages, calls, call, resolved, calibration),
     );
     asked.forEach((a, index) => answers.set(candidates[index]!.id, a.answer));
     fitted = { tokens: Math.max(...asked.map((a) => a.tokens)), stage: 'local' };
-    requests = candidates.length;
+    truncatedRetries = asked.reduce((sum, a) => sum + a.retries, 0);
+    requests = candidates.length + truncatedRetries;
   } else if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
@@ -399,17 +424,28 @@ export async function compact(
     requests = batches.length;
   }
 
-  const decisions = calls.map(
-    (call) =>
-      ruled.get(call.id) ??
-      decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
-  );
-  const kept = applyDecisions(
-    messages,
-    decisions,
-    calls,
-    resolved.truncateHeadChars,
-  );
+  const decide = (threshold: number) => {
+    const decisions = calls.map(
+      (call) =>
+        ruled.get(call.id) ??
+        decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, { keepThreshold: threshold }),
+    );
+    const kept = applyDecisions(messages, decisions, calls, resolved.truncateHeadChars);
+    return { decisions, kept, charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0) };
+  };
+  // Laya's probabilities bunch up in 0.5-0.9, so a fixed cut keeps nearly
+  // everything; walk the cut up its ranking until the target is saved.
+  let threshold = resolved.keepThreshold;
+  let applied = decide(threshold);
+  const cuts = [...new Set([...answers.values()].flatMap((a) => [a.keepCall, a.keepResult]))]
+    .filter((cut) => cut > threshold)
+    .sort((a, b) => a - b);
+  for (const cut of cuts) {
+    if (charsBefore - applied.charsAfter >= resolved.targetReduction * charsBefore) break;
+    threshold = cut;
+    applied = decide(threshold);
+  }
+  const { decisions, kept, charsAfter } = applied;
   return {
     messages: kept,
     decisions,
@@ -417,13 +453,15 @@ export async function compact(
       messagesBefore: messages.length,
       messagesAfter: kept.length,
       charsBefore,
-      charsAfter: kept.reduce((sum, message) => sum + messageChars(message), 0),
+      charsAfter,
       calls: calls.length,
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
       superseded: count(decisions, 'superseded'),
+      truncatedRetries,
       pinned: count(decisions, 'pinned'),
+      threshold,
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
       requests,

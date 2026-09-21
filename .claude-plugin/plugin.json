@@ -1,6 +1,6 @@
 {
   "name": "fast-laya-compaction",
-  "version": "0.3.0",
+  "version": "0.3.2",
   "description": "Verbatim Laya-guided compaction for Claude Code sessions, scored by a local Laya model (no API cost).",
   "license": "MIT",
   "userConfig": {
@@ -13,8 +13,14 @@
     "keepThreshold": {
       "type": "number",
       "title": "Keep threshold",
-      "description": "Minimum Laya probability that a tool call or tool result is still needed; below it the item is removed.",
+      "description": "Tool calls and results scoring below this Laya probability are always removed; the cut rises above it until the target reduction is met.",
       "default": 0.5
+    },
+    "targetReduction": {
+      "type": "number",
+      "title": "Target reduction",
+      "description": "Share of the transcript's characters to remove, dropping the lowest-scored tool calls and results first (Laya's absolute probabilities bunch in 0.5-0.9, only its ranking is informative). 0 uses the keep threshold as a fixed cut.",
+      "default": 0.6
     },
     "preserveRecentMessages": {
       "type": "number",
