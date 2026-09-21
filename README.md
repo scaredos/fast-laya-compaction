@@ -4,6 +4,16 @@ Claude Code plugin that replaces the compaction summary with **Laya** decisions:
 every tool call and result is scored, stale ones are dropped or truncated,
 everything kept stays verbatim. Also usable as an npm library.
 
+**Scope: tool calls only.** Laya judges tool calls and their outputs (file
+reads, command output, search results). User prompts and assistant replies are
+never scored, shortened or removed. This makes the plugin most effective on
+tool-heavy sessions, where outputs are the bulk of the context (a 650k-token
+scraping session lost 60%), and least effective on prose-heavy ones, where
+the built-in summarizer still runs (see [Install in Claude Code](#install-in-claude-code)). The trade-off
+is deliberate: a summary reaches a smaller context (~16k tokens on a 158k
+session, against ~45k for pruning), but pruning takes under a second, costs
+no model call, and rewrites nothing.
+
 > Fork of [`fast-jev-compaction`](https://github.com/tamaratran/fast-jev-compaction).
 > The only change is the scorer: instead of the paid TypeSafe/Jev API, it calls
 > a **local Laya model** ([NandhaKishorM/laya](https://github.com/NandhaKishorM/laya))
@@ -22,9 +32,9 @@ everything kept stays verbatim. Also usable as an npm library.
 Most context compaction asks an LLM to summarize old turns. A summary is
 lossy: a file path, exact error, constraint, or command can disappear even when
 it matters later. This library never rewrites anything. It only deletes tool
-calls and tool results Jev says are no longer needed, and it asks Jev while
-showing it the whole conversation. User and assistant text stays verbatim and
-in order.
+calls and tool results Laya says are no longer needed. User and assistant text
+is out of scope: it stays verbatim and in order, however long the conversation
+gets, so the reduction comes entirely from tool outputs.
 
 The repository is both an npm package (`src/`) and a Claude Code plugin
 (`hooks/`, `.claude-plugin/`) that uses the package to replace Claude Code's
