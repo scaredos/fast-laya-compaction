@@ -1,7 +1,7 @@
 {
-  "name": "fast-jev-compaction",
+  "name": "fast-laya-compaction",
   "version": "0.2.0",
-  "description": "Continuous, verbatim context compaction for LLM agents using TypeSafe's Jev model.",
+  "description": "Continuous, verbatim context compaction for LLM agents using a local Laya model.",
   "type": "module",
   "license": "MIT",
   "engines": {
@@ -23,6 +23,8 @@
     "typecheck": "tsc --noEmit && npm run typecheck:hooks",
     "test": "vitest run",
     "demo": "tsx examples/demo.ts",
+    "demo:oversized": "tsx examples/oversized.ts",
+    "calibrate": "tsx examples/calibrate.ts",
     "typecheck:hooks": "tsc -p tsconfig.hooks.json",
     "validate:plugin": "claude plugin validate .claude-plugin/plugin.json"
   },

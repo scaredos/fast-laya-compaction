@@ -1,5 +1,5 @@
 import { noulAnswer } from './request.js';
-import { collectToolCalls, estimateTokens, fitState } from './state.js';
+import { collectToolCalls, estimateTokens, fitState, localState } from './state.js';
 import type {
   CallAnswer,
   CallDecision,
@@ -15,11 +15,24 @@ import type {
 } from './types.js';
 
 export const DEFAULT_OPTIONS: ResolvedCompactOptions = {
+  // `local`: one small state per call, so Laya's 1024-token window holds the
+  // call, its output head and what happened after it. `whole` is upstream's
+  // shared whole-conversation state; only useful with a 32k-class judge.
+  stateMode: 'local',
+  concurrency: 8,
+  rules: true,
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  // Ceiling is Laya's window, not Jev's 32k: laya 0.3.4 silently truncates
+  // every request at 1024 tokens (it reports the count in usage.input_tokens).
+  // These are *estimated* tokens, and Laya's tokenizer counts 1.5-1.75x more
+  // than the estimate on code-heavy content (examples/calibrate.ts measured
+  // est 610 -> 948 real, est 828 -> truncated), so 620 estimated for a whole
+  // request lands at ~1000 real.
+  // ponytail: constant safety factor; a real tokenizer if it wastes too much.
+  maxStateTokens: 500,
+  maxRequestTokens: 620,
   truncateHeadChars: 300,
 };
 
@@ -32,6 +45,9 @@ function finite(value: number | undefined, fallback: number): number {
 
 export function resolveOptions(options: CompactOptions = {}): ResolvedCompactOptions {
   return {
+    stateMode: options.stateMode === 'whole' ? 'whole' : 'local',
+    concurrency: Math.max(1, Math.floor(finite(options.concurrency, DEFAULT_OPTIONS.concurrency))),
+    rules: options.rules ?? DEFAULT_OPTIONS.rules,
     goal: options.goal ?? DEFAULT_OPTIONS.goal,
     keepThreshold: finite(options.keepThreshold, DEFAULT_OPTIONS.keepThreshold),
     preserveRecentMessages: Math.max(
@@ -61,6 +77,9 @@ export function questionsFor(call: ToolCall): JevQuestions {
     },
     [`result_${call.id}`]: {
       type: 'noul',
+      // Tried explicit true/false `criteria` here: Laya's probabilities collapsed
+      // to ~0.5 and the extra text cost a third of the state budget. Plain
+      // instructions discriminate better (examples/oversized.ts).
       instructions: `The full output of tool call ${call.id} (${call.tool}, ${call.resultChars} chars) should stay in the history verbatim: the assistant still needs its contents and re-running the tool would not do`,
     },
   };
@@ -98,6 +117,36 @@ export function batchCalls(
   return batches;
 }
 
+const WRITERS = new Set(['Edit', 'Write', 'MultiEdit', 'NotebookEdit']);
+const PATH_KEYS = ['file_path', 'notebook_path'] as const;
+
+function pathOf(call: Pick<ToolCall, 'input'>): string | undefined {
+  for (const key of PATH_KEYS) {
+    const value = call.input[key];
+    if (typeof value === 'string' && value.length > 0) return value;
+  }
+  return undefined;
+}
+
+/**
+ * Mechanical staleness, settled without the judge: an identical later call
+ * (same tool, same input) replaces this one's output, and a later Edit/Write
+ * of the file this call read changes what a re-run would return. Returns the
+ * oldest such later call.
+ */
+// ponytail: O(n²) over calls and file_path/notebook_path only (a Bash `sed`
+// is invisible); index by path/input if sessions get huge.
+export function supersededBy(call: ToolCall, calls: readonly ToolCall[]): ToolCall | undefined {
+  const input = JSON.stringify(call.input);
+  const path = pathOf(call);
+  return calls.find(
+    (later) =>
+      later.callIndex > call.callIndex &&
+      ((later.tool === call.tool && JSON.stringify(later.input) === input) ||
+        (path !== undefined && WRITERS.has(later.tool) && pathOf(later) === path)),
+  );
+}
+
 export function decideCall(
   call: Pick<ToolCall, 'id' | 'tool' | 'pinned'>,
   answer: CallAnswer,
@@ -130,6 +179,48 @@ async function askBatch(
       },
     ]),
   );
+}
+
+/** Runs `fn` over `items` with at most `limit` in flight; results keep item order. */
+async function mapLimit<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results: R[] = new Array(items.length);
+  let next = 0;
+  const worker = async (): Promise<void> => {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await fn(items[index]!);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+  return results;
+}
+
+/** One call, one request: its own small state plus its two questions. */
+async function askLocal(
+  asker: JevAsker,
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  call: ToolCall,
+  options: ResolvedCompactOptions,
+): Promise<{ answer: CallAnswer; tokens: number }> {
+  const questions = questionsFor(call);
+  const budget = Math.min(
+    options.maxStateTokens,
+    options.maxRequestTokens - estimateTokens(JSON.stringify(questions)) - REQUEST_OVERHEAD_TOKENS,
+  );
+  const { state, tokens } = localState(messages, calls, call, options, budget);
+  const { answers } = await asker.ask(state, questions);
+  return {
+    answer: {
+      keepCall: noulAnswer(answers, `call_${call.id}`),
+      keepResult: noulAnswer(answers, `result_${call.id}`),
+    },
+    tokens,
+  };
 }
 
 function truncatedResultText(text: string, isError: boolean, headChars: number): string {
@@ -248,11 +339,13 @@ function count(decisions: readonly CallDecision[], reason: CallDecision['reason'
 }
 
 /**
- * Compacts a transcript by asking Jev, for every tool call outside the pinned
- * first and newest messages, whether the call and whether its result must
- * stay. The whole history (results omitted, fitted into `maxStateTokens`) is
- * sent as state with every batch of questions. Throws when Jev fails or the
- * history cannot be fitted; the caller decides whether to fall back.
+ * Compacts a transcript by asking the judge, for every tool call outside the
+ * pinned first and newest messages, whether the call and whether its result
+ * must stay. In `local` mode each call gets its own small state (the call, its
+ * output head, what happened after) and one request. In `whole` mode the whole
+ * history (results omitted, fitted into `maxStateTokens`) is sent with every
+ * batch of questions. Throws when the judge fails or the history cannot be
+ * fitted; the caller decides whether to fall back.
  */
 export async function compact(
   messages: readonly Message[],
@@ -262,24 +355,54 @@ export async function compact(
   const started = Date.now();
   const resolved = resolveOptions(options);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
+  // Rules first: what is stale by construction never reaches the judge.
+  const ruled = new Map<string, CallDecision>();
+  if (resolved.rules) {
+    for (const call of calls) {
+      if (call.pinned) continue;
+      const by = supersededBy(call, calls);
+      if (by) {
+        ruled.set(call.id, {
+          id: call.id,
+          tool: call.tool,
+          keepCall: 1,
+          keepResult: 0,
+          action: 'drop_result',
+          reason: 'superseded',
+          supersededBy: by.id,
+        });
+      }
+    }
+  }
+  const candidates = calls.filter((call) => !call.pinned && !ruled.has(call.id));
+
   let fitted: { tokens: number; stage: string } = { tokens: 0, stage: '' };
-  let batches: ToolCall[][] = [];
+  let requests = 0;
   const answers = new Map<string, CallAnswer>();
-  if (candidates.length > 0) {
+  if (candidates.length > 0 && resolved.stateMode === 'local') {
+    const asked = await mapLimit(candidates, resolved.concurrency, (call) =>
+      askLocal(asker, messages, calls, call, resolved),
+    );
+    asked.forEach((a, index) => answers.set(candidates[index]!.id, a.answer));
+    fitted = { tokens: Math.max(...asked.map((a) => a.tokens)), stage: 'local' };
+    requests = candidates.length;
+  } else if (candidates.length > 0) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
-    batches = batchCalls(candidates, state.tokens, resolved);
+    const batches = batchCalls(candidates, state.tokens, resolved);
     const answered = await Promise.all(
       batches.map((batch) => askBatch(asker, state.state, batch)),
     );
     for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    requests = batches.length;
   }
 
-  const decisions = calls.map((call) =>
-    decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
+  const decisions = calls.map(
+    (call) =>
+      ruled.get(call.id) ??
+      decideCall(call, answers.get(call.id) ?? { keepCall: 1, keepResult: 1 }, resolved),
   );
   const kept = applyDecisions(
     messages,
@@ -299,10 +422,11 @@ export async function compact(
       kept: count(decisions, 'kept'),
       resultsDropped: count(decisions, 'result_dropped'),
       callsDropped: count(decisions, 'call_dropped'),
+      superseded: count(decisions, 'superseded'),
       pinned: count(decisions, 'pinned'),
       stateTokens: fitted.tokens,
       stateStage: fitted.stage,
-      requests: batches.length,
+      requests,
       ms: Date.now() - started,
     },
   };

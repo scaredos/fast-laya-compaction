@@ -2,6 +2,7 @@ import type {
   CompactionState,
   FittedState,
   HistoryEntry,
+  LocalState,
   Message,
   ResolvedCompactOptions,
   ToolCall,
@@ -299,6 +300,104 @@ export function fitState(
   if (fits()) return fitted(history, tokens, 'old calls merged');
 
   throw new Error(
-    `history too large for Jev (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
+    `history too large for the judge (~${tokens} tokens after truncation, limit ${options.maxStateTokens})`,
   );
+}
+
+// Kept short on purpose: every token here is one less for `after`.
+export const LOCAL_CONTEXT =
+  'Judging one tool call of a coding assistant conversation for compaction. `call`: the call, its input, the head of its output. `after`: what happened later, oldest first (later calls as `id tool input → status chars`, later messages abridged). Whatever is not kept is deleted, but the assistant can re-run tools and re-read files.';
+
+/** Successive [input chars, result chars] caps for the call itself. */
+const LOCAL_CALL_CAPS = [
+  [300, 500],
+  [100, 150],
+  [60, 0],
+] as const;
+const AFTER_TEXT_CHARS = { user: 200, assistant: 120 } as const;
+const RELATED_MAX_CHARS = 200;
+
+function resultText(messages: readonly Message[], call: ToolCall): string {
+  const message = messages[call.resultIndex];
+  return message?.toolResults?.find((r) => r.tool_use_id === call.tool_use_id)?.text ?? '';
+}
+
+function shortInputs(call: ToolCall): string[] {
+  return Object.values(call.input).filter(
+    (value): value is string =>
+      typeof value === 'string' && value.trim().length >= 4 && value.length <= RELATED_MAX_CHARS,
+  );
+}
+
+/**
+ * A later call touching the same path or command is the strongest staleness
+ * signal (a Read followed by an Edit of that file, a test re-run), so those
+ * lines are budgeted first.
+ */
+// ponytail: substring overlap on short string inputs; an embedding or a
+// per-tool path extractor if this misses too much.
+function related(call: ToolCall, later: ToolCall): boolean {
+  const own = shortInputs(call);
+  const theirs = shortInputs(later);
+  return own.some((a) => theirs.some((b) => a === b || a.includes(b) || b.includes(a)));
+}
+
+/**
+ * Builds the `local` state for one call within `budget` tokens: goal and the
+ * call first (input and result head shrunk in steps until they fit), then
+ * `after` lines added greedily — related later calls and later user prompts
+ * first, the rest chronologically — and rendered oldest first.
+ */
+export function localState(
+  messages: readonly Message[],
+  calls: readonly ToolCall[],
+  call: ToolCall,
+  options: Pick<ResolvedCompactOptions, 'goal'>,
+  budget: number,
+): { state: LocalState; tokens: number } {
+  const goal = options.goal || goalFromMessages(messages);
+  const output = resultText(messages, call);
+  let state!: LocalState;
+  let tokens = 0;
+  for (const [inputChars, resultChars] of LOCAL_CALL_CAPS) {
+    state = {
+      context: LOCAL_CONTEXT,
+      goal,
+      call: {
+        id: call.id,
+        tool: call.tool,
+        input: inputText(call.input, inputChars),
+        status: call.isError ? 'error' : 'ok',
+        chars: call.resultChars,
+        result: resultChars > 0 ? truncate(output, resultChars) : '',
+      },
+      after: [],
+    };
+    tokens = estimateTokens(JSON.stringify(state));
+    if (tokens <= budget) break;
+  }
+
+  type Line = { i: number; kind: 0 | 1; priority: 0 | 1; text: string };
+  const lines: Line[] = [];
+  messages.forEach((message, i) => {
+    if (i <= call.resultIndex || message.text.trim().length === 0) return;
+    const text = truncate(message.text.replace(/\s+/g, ' '), AFTER_TEXT_CHARS[message.role]);
+    lines.push({ i, kind: 0, priority: message.role === 'user' ? 0 : 1, text: `[${message.role}] ${text}` });
+  });
+  for (const later of calls) {
+    if (later.callIndex <= call.callIndex) continue;
+    lines.push({ i: later.callIndex, kind: 1, priority: related(call, later) ? 0 : 1, text: compactCall(later) });
+  }
+  const chosen = new Set<Line>();
+  for (const line of [...lines].sort((a, b) => a.priority - b.priority || a.i - b.i)) {
+    const cost = estimateTokens(JSON.stringify(line.text)) + 1;
+    if (tokens + cost > budget) continue; // a shorter later line may still fit
+    chosen.add(line);
+    tokens += cost;
+  }
+  state.after = lines
+    .filter((line) => chosen.has(line))
+    .sort((a, b) => a.i - b.i || a.kind - b.kind)
+    .map((line) => line.text);
+  return { state, tokens };
 }

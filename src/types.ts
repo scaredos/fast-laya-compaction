@@ -60,7 +60,9 @@ export interface CallDecision extends CallAnswer {
   id: string;
   tool: string;
   action: CallAction;
-  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped';
+  reason: 'pinned' | 'kept' | 'result_dropped' | 'call_dropped' | 'superseded';
+  /** Id of the later call that made this one's output stale (`superseded` only). */
+  supersededBy?: string;
 }
 
 export interface HistoryToolCall {
@@ -92,7 +94,41 @@ export interface FittedState {
   stage: string;
 }
 
+/**
+ * The state for one call in `local` mode: sized to a small judge window,
+ * so it holds only the call, the head of its output, and what happened later.
+ */
+export interface LocalState {
+  context: string;
+  goal: string;
+  call: {
+    id: string;
+    tool: string;
+    input: string;
+    status: 'ok' | 'error';
+    chars: number;
+    /** Head of the tool output, so the judge knows what kind of content it is. */
+    result: string;
+  };
+  /** Later calls (one line each) and later messages (abridged), oldest first. */
+  after: string[];
+}
+
+export type StateMode = 'local' | 'whole';
+
 export interface CompactOptions {
+  /**
+   * `local` (default): one small state per call, fitted to the judge's window.
+   * `whole`: the whole conversation as one shared state (needs a 32k-class judge).
+   */
+  stateMode?: StateMode;
+  /** Requests in flight at once in `local` mode. Default 8. */
+  concurrency?: number;
+  /**
+   * Settle mechanically stale calls without the judge: an identical later call
+   * or a later Edit/Write of the file this call read. Default true.
+   */
+  rules?: boolean;
   /** Ongoing task description; defaults to the last few user prompts. */
   goal?: string;
   /** Minimum keep probability for a call or result to stay. Default 0.5. */
@@ -108,6 +144,9 @@ export interface CompactOptions {
 }
 
 export interface ResolvedCompactOptions {
+  stateMode: StateMode;
+  concurrency: number;
+  rules: boolean;
   goal: string;
   keepThreshold: number;
   preserveRecentMessages: number;
@@ -129,6 +168,8 @@ export interface CompactResult {
     kept: number;
     resultsDropped: number;
     callsDropped: number;
+    /** Results truncated by the rules, without a judge request. */
+    superseded: number;
     pinned: number;
     stateTokens: number;
     /** Which fitting stage the state needed, '' when no request was made. */

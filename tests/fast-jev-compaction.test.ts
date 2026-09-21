@@ -5,14 +5,15 @@ import {
   buildJevRequest,
   collectToolCalls,
   compact,
-  compactMessages,
   decideCall,
   estimateTokens,
   fitState,
   JevClient,
+  localState,
   parseJevResponse,
   reductionRatio,
   resolveOptions,
+  supersededBy,
   type HistoryToolCall,
   type JevAsker,
   type JevQuestions,
@@ -76,8 +77,8 @@ describe('options', () => {
     expect(resolveOptions()).toMatchObject({
       keepThreshold: 0.5,
       preserveRecentMessages: 6,
-      maxStateTokens: 25_000,
-      maxRequestTokens: 30_000,
+      maxStateTokens: 500,
+      maxRequestTokens: 620,
       truncateHeadChars: 300,
     });
     expect(resolveOptions({
@@ -332,8 +333,125 @@ describe('decisions', () => {
   });
 });
 
+describe('local state', () => {
+  const session: Message[] = [
+    message('user', 'Fix the failing test in src/a.ts'),
+    call('tool-1', 'Read', { file_path: 'src/a.ts' }, fileA),
+    result('tool-1', fileA),
+    call('tool-2', 'Read', { file_path: 'src/components/some/long/name.ts' }, fileB),
+    result('tool-2', fileB),
+    message('assistant', 'I will edit a.ts next, then re-run the whole suite to confirm the fix.'),
+    call('tool-3', 'Edit', { file_path: 'src/a.ts', old_string: 'a = 1', new_string: 'a = 2' }, 'ok'),
+    result('tool-3', 'The file src/a.ts has been updated.'),
+    call('tool-4', 'Bash', { command: 'npm test' }, 'PASS'),
+    result('tool-4', 'PASS'),
+    message('user', 'add a changelog'),
+  ];
+
+  it('holds the call, its output head and what happened after it, oldest first', () => {
+    const calls = collectToolCalls(session, 0);
+    const { state, tokens } = localState(session, calls, calls[0]!, { goal: '' }, 800);
+    expect(tokens).toBeLessThanOrEqual(800);
+    expect(state.call).toMatchObject({ id: 't1', tool: 'Read', status: 'ok', chars: fileA.length });
+    expect(state.call.result).toBe(`${fileA.slice(0, 499)}…`);
+    expect(state.goal).toContain('add a changelog');
+    expect(state.after).toEqual([
+      `t2 Read file_path=src/components/some/long/name.ts → ok ${fileB.length}ch`,
+      '[assistant] I will edit a.ts next, then re-run the whole suite to confirm the fix.',
+      expect.stringMatching(/^t3 Edit file_path=src\/a\.ts old_string=a = 1 new_string=a = 2 → ok \d+ch$/),
+      't4 Bash command=npm test → ok 4ch',
+      '[user] add a changelog',
+    ]);
+  });
+
+  it('budgets related later calls and user prompts before the rest', () => {
+    const calls = collectToolCalls(session, 0);
+    const { state: all } = localState(session, calls, calls[0]!, { goal: '' }, 10_000);
+    const base = estimateTokens(JSON.stringify({ ...all, after: [] }));
+    const cost = (line: string): number => estimateTokens(JSON.stringify(line)) + 1;
+    const edit = all.after.find((line) => line.startsWith('t3 Edit'))!;
+    const prompt = '[user] add a changelog';
+
+    // Room for exactly the Edit of the same file and the later user prompt.
+    const { state, tokens } = localState(session, calls, calls[0]!, { goal: '' }, base + cost(edit) + cost(prompt));
+    expect(state.after).toEqual([edit, prompt]);
+    expect(tokens).toBe(base + cost(edit) + cost(prompt));
+
+    // Too tight for any line: the call shrinks but stays, `after` is empty.
+    const { state: bare } = localState(session, calls, calls[0]!, { goal: '' }, 1);
+    expect(bare.call.id).toBe('t1');
+    expect(bare.call.result).toBe('');
+    expect(bare.after).toEqual([]);
+  });
+});
+
+describe('rules', () => {
+  const session: Message[] = [
+    message('user', 'fix it'),
+    call('tool-1', 'Read', { file_path: 'src/a.ts' }, fileA),
+    result('tool-1', fileA),
+    call('tool-2', 'Bash', { command: 'npm test' }, 'FAIL'),
+    result('tool-2', 'FAIL', true),
+    call('tool-3', 'Read', { file_path: 'src/b.ts' }, fileB),
+    result('tool-3', fileB),
+    call('tool-4', 'Edit', { file_path: 'src/a.ts', old_string: 'a = 1', new_string: 'a = 2' }, 'ok'),
+    result('tool-4', 'The file src/a.ts has been updated.'),
+    call('tool-5', 'Bash', { command: 'npm test' }, 'PASS'),
+    result('tool-5', 'PASS'),
+    call('tool-6', 'Read', { file_path: 'src/a.ts' }, fileA),
+    result('tool-6', fileA),
+    message('user', 'thanks'),
+  ];
+
+  it('finds the oldest later call that makes a result stale', () => {
+    const calls = collectToolCalls(session, 0);
+    const [read, test, readB, edit, retest, reread] = calls as [ToolCall, ToolCall, ToolCall, ToolCall, ToolCall, ToolCall];
+    expect(supersededBy(read, calls)?.id).toBe(edit.id); // later Edit of the same file
+    expect(supersededBy(test, calls)?.id).toBe(retest.id); // identical later command
+    expect(supersededBy(readB, calls)).toBeUndefined(); // nothing touched b.ts
+    expect(supersededBy(edit, calls)).toBeUndefined(); // a later Read does not stale an Edit
+    expect(supersededBy(retest, calls)).toBeUndefined();
+    expect(supersededBy(reread, calls)).toBeUndefined(); // only later calls count
+  });
+
+  it('settles superseded calls without asking, and asks when rules are off', async () => {
+    const seen: Seen[] = [];
+    const output = await compact(session, fakeJev(() => 0.9, seen), { preserveRecentMessages: 1 });
+    expect(seen.map((r) => r.questions[0])).toEqual(['call_t3', 'call_t4', 'call_t5', 'call_t6']);
+    expect(output.decisions.slice(0, 2)).toEqual([
+      { id: 't1', tool: 'Read', keepCall: 1, keepResult: 0, action: 'drop_result', reason: 'superseded', supersededBy: 't4' },
+      { id: 't2', tool: 'Bash', keepCall: 1, keepResult: 0, action: 'drop_result', reason: 'superseded', supersededBy: 't5' },
+    ]);
+    expect(output.stats).toMatchObject({ superseded: 2, kept: 4, requests: 4 });
+    expect(output.messages[2]?.toolResults?.[0]?.text).toMatch(/truncated \d+ chars/);
+
+    const all: Seen[] = [];
+    const pure = await compact(session, fakeJev(() => 0.9, all), { preserveRecentMessages: 1, rules: false });
+    expect(all).toHaveLength(6);
+    expect(pure.stats).toMatchObject({ superseded: 0, kept: 6, requests: 6 });
+  });
+});
+
 describe('compact', () => {
-  it('resends the full state with every batch and merges the answers', async () => {
+  it('asks one request per candidate with its own state in local mode', async () => {
+    const seen: Seen[] = [];
+    const output = await compact(
+      transcript(),
+      fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
+      { preserveRecentMessages: 1 },
+    );
+    expect(seen).toHaveLength(3);
+    expect(seen.map((r) => (r.state as { call: { id: string } }).call.id)).toEqual(['t1', 't2', 't3']);
+    expect(seen.map((r) => r.questions)).toEqual([
+      ['call_t1', 'result_t1'],
+      ['call_t2', 'result_t2'],
+      ['call_t3', 'result_t3'],
+    ]);
+    expect(output.stats).toMatchObject({ requests: 3, stateStage: 'local', resultsDropped: 3 });
+    expect(output.stats.stateTokens).toBeLessThanOrEqual(500);
+  });
+
+  it('resends the full state with every batch and merges the answers in whole mode', async () => {
     const seen: Seen[] = [];
     const messages = transcript();
     const stateTokens = fitState(messages, collectToolCalls(messages, 1), {
@@ -344,7 +462,7 @@ describe('compact', () => {
     const output = await compact(
       messages,
       fakeJev((name) => (name.startsWith('call_') ? 0.9 : 0.1), seen),
-      { preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
+      { stateMode: 'whole', preserveRecentMessages: 1, maxRequestTokens: stateTokens + 150 },
     );
 
     expect(output.stats.requests).toBe(seen.length);
@@ -384,23 +502,29 @@ describe('compact', () => {
       ask: async () => ({ answers: { call_t1: { noul: 0.5 } } }),
     };
     await expect(compact(transcript(), broken, { preserveRecentMessages: 1 })).rejects.toThrow(
-      /Invalid Jev answer/,
+      /Invalid Laya answer/,
     );
   });
 });
 
 describe('HTTP client', () => {
-  it('builds a System One request', () => {
+  it('builds a local Laya request', () => {
     const request = buildJevRequest({ apiKey: 'k' }, { a: 1 }, {
       q: { type: 'noul', instructions: 'x' },
     });
-    expect(request.url).toBe('https://api.typesafe.ai/v1/systemone');
+    expect(request.url).toBe('http://127.0.0.1:8756/predict');
     expect(request.headers.authorization).toBe('Bearer k');
     expect(JSON.parse(request.body)).toEqual({
-      model: 'jev-latest',
+      model: 'router',
       state: { a: 1 },
       questions: { q: { type: 'noul', instructions: 'x' } },
     });
+  });
+
+  it('omits the auth header when no key is set (local Laya needs none)', () => {
+    const request = buildJevRequest({}, { a: 1 }, { q: { type: 'noul', instructions: 'x' } });
+    expect(request.url).toBe('http://127.0.0.1:8756/predict');
+    expect(request.headers.authorization).toBeUndefined();
   });
 
   it('rejects failed and malformed responses', () => {
@@ -410,11 +534,11 @@ describe('HTTP client', () => {
     expect(parseJevResponse(200, true, '{"answers":{}}')).toEqual({ answers: {} });
   });
 
-  it('asks over fetch and refuses to run without a key', async () => {
+  it('asks over fetch and works without a key', async () => {
     const bodies: string[] = [];
     const client = new JevClient({
-      apiKey: 'k',
-      model: 'jev-test',
+      apiKey: '',
+      model: 'multilingual',
       fetch: (async (_url: string | URL | Request, init?: RequestInit) => {
         bodies.push(String(init?.body));
         return new Response(JSON.stringify({ answers: { q: { noul: 0.4 } } }), { status: 200 });
@@ -422,12 +546,6 @@ describe('HTTP client', () => {
     });
     const response = await client.ask('state', { q: { type: 'noul', instructions: 'x' } });
     expect(response.answers.q).toEqual({ noul: 0.4 });
-    expect(JSON.parse(bodies[0]!).model).toBe('jev-test');
-
-    const keyless = new JevClient({ apiKey: '' });
-    await expect(keyless.ask('s', {})).rejects.toThrow(/TYPESAFE_API_KEY/);
-    await expect(
-      compactMessages(transcript(), { apiKey: '', preserveRecentMessages: 1 }),
-    ).rejects.toThrow(/TYPESAFE_API_KEY/);
+    expect(JSON.parse(bodies[0]!).model).toBe('multilingual');
   });
 });

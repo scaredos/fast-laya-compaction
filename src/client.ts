@@ -2,17 +2,17 @@ import { buildJevRequest, parseJevResponse } from './request.js';
 import type { JevAsker, JevQuestions, JevResponse, JevState } from './types.js';
 
 export interface JevClientOptions {
-  /** Defaults to `process.env.TYPESAFE_API_KEY`. */
+  /** Optional; local Laya needs none. Defaults to `process.env.TYPESAFE_API_KEY` if set. */
   apiKey?: string;
-  /** Defaults to `jev-latest`. */
+  /** Defaults to `router` (Laya auto-selects the checkpoint). */
   model?: string;
-  /** Defaults to the System One endpoint. */
+  /** Defaults to the local Laya server (`http://127.0.0.1:8756/predict`). */
   baseUrl?: string;
   /** Defaults to the global `fetch`. */
   fetch?: typeof fetch;
 }
 
-/** Asks Jev over HTTP with the global `fetch` (or an injected one). */
+/** Asks Laya over HTTP with the global `fetch` (or an injected one). */
 export class JevClient implements JevAsker {
   private readonly apiKey: string;
   private readonly model: string | undefined;
@@ -27,7 +27,6 @@ export class JevClient implements JevAsker {
   }
 
   async ask(state: JevState, questions: JevQuestions): Promise<JevResponse> {
-    if (!this.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
     const request = buildJevRequest(
       { apiKey: this.apiKey, model: this.model, baseUrl: this.baseUrl },
       state,

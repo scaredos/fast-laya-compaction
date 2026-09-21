@@ -42,6 +42,7 @@ export type HookFetch = (url: string, init?: HookFetchInit) => Promise<HookFetch
 
 export type HookConfig = CompactOptions & {
   apiKey?: string;
+  baseUrl?: string;
   compactAtPercent: number;
   minReductionRatio: number;
   model: string;
@@ -66,10 +67,14 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
+    'concurrency',
   ] as const) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
   }
+  const stateMode = optionString(options, 'stateMode');
+  if (stateMode === 'local' || stateMode === 'whole') numbers.stateMode = stateMode;
+  if (typeof options['rules'] === 'boolean') numbers.rules = options['rules'];
   const config: HookConfig = {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
@@ -82,16 +87,23 @@ export function resolveHookConfig(options: PluginOptions): HookConfig {
   };
   const apiKey = optionString(options, 'apiKey');
   if (apiKey) config.apiKey = apiKey;
+  const baseUrl = optionString(options, 'baseUrl');
+  if (baseUrl) config.baseUrl = baseUrl;
   const goal = optionString(options, 'goal');
   if (goal) config.goal = goal;
   return config;
 }
 
-/** A `JevAsker` over the engine's `$.http.fetch`. */
-export function jevAsker(fetchFn: HookFetch, apiKey: string, model: string): JevAsker {
+/** A `JevAsker` over the engine's `$.http.fetch`, pointed at the local Laya server. */
+export function jevAsker(
+  fetchFn: HookFetch,
+  model: string,
+  apiKey?: string,
+  baseUrl?: string,
+): JevAsker {
   return {
     async ask(state, questions) {
-      const request = buildJevRequest({ apiKey, model }, state, questions);
+      const request = buildJevRequest({ apiKey: apiKey ?? '', model, baseUrl }, state, questions);
       const response = await fetchFn(request.url, {
         method: request.method,
         headers: request.headers,
@@ -161,14 +173,14 @@ export type SessionCompaction = {
   messages: SessionMessage[];
 };
 
-/** Runs the library over a session transcript; throws when the key is missing or Jev fails. */
+/** Runs the library over a session transcript; throws when Laya fails or is unreachable. */
 export async function compactSession(
   messages: readonly SessionMessage[],
   config: HookConfig,
   fetchFn: HookFetch,
 ): Promise<SessionCompaction> {
-  if (!config.apiKey) throw new Error('TYPESAFE_API_KEY is not configured');
-  const result = await compact(messages, jevAsker(fetchFn, config.apiKey, config.model), config);
+  const asker = jevAsker(fetchFn, config.model, config.apiKey, config.baseUrl);
+  const result = await compact(messages, asker, config);
   return { result, messages: toSessionMessages(messages, result.messages) };
 }
 
@@ -181,6 +193,7 @@ export function summarize(result: CompactResult): string {
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
+    stats.superseded > 0 ? `${stats.superseded} superseded` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
@@ -262,7 +275,12 @@ export const register: Register = (on: On, options: PluginOptions) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const config = { ...configured, apiKey: await getApiKey($, configured) };
+      const layaUrl = await $.env.get('LAYA_URL');
+      const config = {
+        ...configured,
+        apiKey: await getApiKey($, configured),
+        baseUrl: configured.baseUrl ?? layaUrl, // userConfig wins, else LAYA_URL, else the library default
+      };
       const { result, messages } = await compactSession(event.messages, config, async (url, init) => {
         const response = await $.http.fetch(url, init);
         return { status: response.status, ok: response.ok, text: response.text };

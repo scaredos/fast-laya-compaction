@@ -53,7 +53,7 @@ function jevFetch(answer: (name: string) => number, bodies: string[] = []) {
 
 describe('hook config', () => {
   it('reads userConfig values and falls back to defaults', () => {
-    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'jev-latest' });
+    expect(resolveHookConfig({})).toEqual({ compactAtPercent: 60, minReductionRatio: 0.25, model: 'router' });
     expect(
       resolveHookConfig({ apiKey: 'k', keepThreshold: 0.3, maxStateTokens: 1000, model: 'jev-x', goal: 'g', compactAtPercent: 'no' }),
     ).toEqual({
@@ -118,11 +118,13 @@ describe('compactSession', () => {
       config,
       jevFetch((name) => (name === 'call_t2' || name === 'result_t2' ? 0.9 : 0.1), bodies),
     );
-    expect(bodies).toHaveLength(1);
+    // local mode: one request per candidate call, each with its own state
+    expect(bodies).toHaveLength(2);
     expect(JSON.parse(bodies[0]!).model).toBe('jev-x');
+    expect(bodies.map((b) => JSON.parse(b).state.call.id)).toEqual(['t1', 't2']);
     expect(output.decisions.map((d) => d.action)).toEqual(['drop_call', 'keep']);
     expect(messages.map((m) => m.handle)).toEqual(['h-0', 'h-tool-2', 'r-tool-2', 'h-5', 'h-6']);
-    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(full\) in 1 request\(s\)$/);
+    expect(summarize(output)).toMatch(/^\d+% reduction; 1 kept, 1 call_dropped; state ~\d+ tokens \(local\) in 2 request\(s\)$/);
     expect(decisionLog(output)).toBe('t1:Read:drop_call/call=0.10/result=0.10 t2:Bash:keep/call=0.90/result=0.90');
     expect(decisionLogLines(output)).toEqual([`decisions: ${decisionLog(output)}`]);
   });
@@ -139,11 +141,14 @@ describe('compactSession', () => {
     expect(decisionLogLines({ ...output, decisions: [] })).toEqual(['decisions: (none)']);
   });
 
-  it('throws on a missing key and on failed requests so the hook falls back', async () => {
+  it('needs no key and throws on failed requests so the hook falls back', async () => {
     const config = resolveHookConfig({ preserveRecentMessages: 1 });
-    await expect(compactSession(transcript(), config, jevFetch(() => 0))).rejects.toThrow(/TYPESAFE_API_KEY/);
+    // No key configured: local Laya still answers.
+    const ok = await compactSession(transcript(), config, jevFetch(() => 0));
+    expect(ok.result.decisions.length).toBeGreaterThan(0);
+    // A server error (e.g. Laya server not running) throws so the hook falls back.
     await expect(
-      compactSession(transcript(), { ...config, apiKey: 'k' }, async () => ({ status: 500, ok: false, text: 'x' })),
+      compactSession(transcript(), config, async () => ({ status: 500, ok: false, text: 'x' })),
     ).rejects.toThrow(/500/);
   });
 });
