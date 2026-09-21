@@ -6,7 +6,9 @@ judged no longer needed. `hooks/fast-jev.ts` (name kept from upstream) is a
 thin adapter: it reads the plugin options, hands `session.compact` transcripts
 to the `fast-laya-compaction` library in `src/` (the plugin folder is the
 repository root, so the hook imports it directly) and maps the result back
-onto session messages. User and assistant text is never touched. For every
+onto session messages. User and assistant text is never touched: only tool
+calls and their outputs are scored, so the reduction depends on how much of
+the transcript is tool output. For every
 tool call outside the pinned first and newest messages, Laya gets two
 questions: whether the call should stay and whether its full output should
 stay. An item scoring below `keepThreshold` is dropped; above it the cut rises,
